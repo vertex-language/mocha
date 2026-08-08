@@ -40,7 +40,7 @@ frontend and stop there. The backend is already done.
 ## Quick start
 
 ```bash
-go install github.com/vertex-language/mocha/cmd/mocha@latest
+GOPROXY=direct go install github.com/vertex-language/mocha/cmd/mocha@latest
 ```
 
 Or grab a prebuilt binary from [Releases](https://github.com/vertex-language/mocha/releases).

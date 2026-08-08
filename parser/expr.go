@@ -634,7 +634,29 @@ func (p *parser) parseNameOrCall(lo token.Pos) ast.Expr {
 		return x
 	}
 
-	return p.parseName()
+	return p.parseNameStoppingBeforeCall()
+}
+
+// parseNameStoppingBeforeCall reads a dotted Name, the same as parseName, but
+// stops one identifier early when the next segment is immediately followed by
+// `(`. That final `Identifier (` is a method invocation, not a name
+// continuation, and leaving it unconsumed lets parsePostfix's PERIOD case hand
+// it to parseSelector, which builds the CallExpr.
+//
+// parseName itself is left alone: its other callers (package, import and
+// module-directive names, annotation names) never sit in a position where a
+// trailing segment could be a call, so the extra lookahead here would be
+// pointless there.
+func (p *parser) parseNameStoppingBeforeCall() *ast.Name {
+	n := alloc[ast.Name](p.arena)
+	lo := p.pos()
+	n.Parts = append(n.Parts, p.parseIdent())
+	for p.at(token.PERIOD) && p.peek(1).Kind == token.IDENT && p.peek(2).Kind != token.LPAREN {
+		p.next()
+		n.Parts = append(n.Parts, p.parseIdent())
+	}
+	n.Span = ast.At(lo, p.prevEnd())
+	return n
 }
 
 func (p *parser) parseNewExpr(lo token.Pos) ast.Expr {
