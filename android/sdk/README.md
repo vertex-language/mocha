@@ -3,11 +3,11 @@
 `package sdk` fetches and caches Android platform stubs.
 
 ```
-import "github.com/vertex-language/mocha/sdk"
+import "github.com/vertex-language/mocha/android/sdk"
 ```
 
 ```
-go get github.com/vertex-language/mocha/sdk
+go get github.com/vertex-language/mocha/android/sdk
 ```
 
 One job: given an API level, produce a path to an `android.jar`.
@@ -28,7 +28,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/vertex-language/mocha/sdk"
+	"github.com/vertex-language/mocha/android/sdk"
 )
 
 func main() {
