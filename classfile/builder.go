@@ -148,6 +148,7 @@ type MethodBuilder struct {
 	maxLocals uint16
 	handlers  []encodedHandler
 	lines     []LineNumber
+	locals    []LocalVariable
 	hasCode   bool
 }
 
@@ -181,6 +182,10 @@ func (m *MethodBuilder) Signature(s string) { m.signature = s }
 // moves everything after it. Replaying the closure with the widening decisions
 // from the previous pass is what makes that tractable.
 //
+// The closure must therefore be deterministic: widening decisions are keyed on
+// branch ordinal, which is stable only if every pass emits the same branches in
+// the same order. Anything with a side effect belongs outside it.
+//
 // max_stack and max_locals are computed as the body is emitted; do not set
 // them yourself. The descriptor's return type is threaded into the CodeWriter,
 // which is what lets CodeWriter.Return pick the right return opcode.
@@ -211,6 +216,7 @@ func (m *MethodBuilder) Code(body func(*CodeWriter)) {
 		c := &CodeWriter{
 			p:         m.b.pool,
 			ret:       sig.Ret,
+			ver:       m.b.version,
 			widen:     widen,
 			pass:      pass,
 			maxLocals: int32(sig.ArgSlots(receiver)),
@@ -251,7 +257,13 @@ func (m *MethodBuilder) Code(body func(*CodeWriter)) {
 		m.maxStack = uint16(c.maxStack)
 		m.maxLocals = uint16(c.maxLocals)
 		m.lines = c.lines
+		m.locals = c.localRows()
 		m.hasCode = true
+
+		if c.err != nil {
+			m.b.fail("method %s: %v", m.name, c.err)
+			return
+		}
 
 		for _, h := range c.handlers {
 			var ct uint16
@@ -404,6 +416,24 @@ func (b *Builder) emitMethod(w *writer, m *MethodBuilder) {
 	attrs.u2(uint16(n))
 
 	if m.hasCode {
+		// The names and descriptors of the debug tables are interned before
+		// the Code attribute is written, for the same reason Bytes builds the
+		// member tables into scratch writers: everything must reach the pool
+		// before pool.emit runs.
+		type lvRow struct {
+			startPC, length, name, descriptor, slot uint16
+		}
+		rows := make([]lvRow, 0, len(m.locals))
+		for _, lv := range m.locals {
+			rows = append(rows, lvRow{
+				startPC:    lv.StartPC,
+				length:     lv.Length,
+				name:       b.pool.UTF8(lv.Name),
+				descriptor: b.pool.UTF8(lv.Descriptor),
+				slot:       lv.Slot,
+			})
+		}
+
 		attrs.attr(b.pool.UTF8("Code"), func(w *writer) {
 			w.u2(m.maxStack)
 			w.u2(m.maxLocals)
@@ -420,6 +450,9 @@ func (b *Builder) emitMethod(w *writer, m *MethodBuilder) {
 			if len(m.lines) > 0 {
 				cn++
 			}
+			if len(rows) > 0 {
+				cn++
+			}
 			w.u2(uint16(cn))
 			if len(m.lines) > 0 {
 				w.attr(b.pool.UTF8("LineNumberTable"), func(w *writer) {
@@ -427,6 +460,18 @@ func (b *Builder) emitMethod(w *writer, m *MethodBuilder) {
 					for _, ln := range m.lines {
 						w.u2(ln.StartPC)
 						w.u2(ln.Line)
+					}
+				})
+			}
+			if len(rows) > 0 {
+				w.attr(b.pool.UTF8("LocalVariableTable"), func(w *writer) {
+					w.u2(uint16(len(rows)))
+					for _, r := range rows {
+						w.u2(r.startPC)
+						w.u2(r.length)
+						w.u2(r.name)
+						w.u2(r.descriptor)
+						w.u2(r.slot)
 					}
 				})
 			}

@@ -3,6 +3,7 @@ package classfile
 import (
 	"fmt"
 	"math"
+	"sort"
 
 	"github.com/vertex-language/mocha/jvm/desc"
 	"github.com/vertex-language/mocha/jvm/op"
@@ -31,6 +32,27 @@ type branch struct {
 	wide  bool
 }
 
+// switchRec is a tableswitch or lookupswitch awaiting its offsets. Unlike a
+// branch it never needs widening: every offset in a switch is a signed 32-bit
+// field. What it does need is its own padding remembered, since that is
+// measured from the start of the code array and therefore moves when an
+// earlier branch widens.
+type switchRec struct {
+	op      op.Op
+	at      int // byte offset of the opcode
+	pad     int
+	def     *Label
+	targets []*Label
+}
+
+// localRec is one row of a LocalVariableTable, in label form. The PCs are not
+// known until the labels resolve, which is after the closure has run.
+type localRec struct {
+	slot       int
+	name, desc string
+	start, end *Label
+}
+
 // A CodeWriter builds a method body. Instances are handed to the closure
 // passed to MethodBuilder.Code and must not escape it: the closure is re-run
 // whenever a branch turns out not to fit in a signed 16-bit offset.
@@ -40,11 +62,14 @@ type CodeWriter struct {
 	err error
 
 	ret desc.Type // the enclosing method's return type, for Return
+	ver Version   // the enclosing class's target version, for Cconst
 
 	labels   []*Label
 	branches []branch
+	switches []switchRec
 	handlers []handlerRec
 	lines    []LineNumber
+	locals   []localRec
 
 	widen map[int]bool // branch ordinals that must use the long form
 	pass  int
@@ -245,6 +270,26 @@ func (c *CodeWriter) Iinc(slot, delta int) {
 	c.w.u2(uint16(int16(delta)))
 }
 
+// Local records a row of the LocalVariableTable: the slot holds a variable of
+// the given name and descriptor between start and end.
+//
+// Call it from inside the closure with labels the closure itself marked. The
+// rows are converted to PCs after the branch fixpoint converges, which is why
+// this takes labels rather than offsets — an offset captured mid-pass would be
+// stale the moment an earlier branch widened.
+func (c *CodeWriter) Local(slot int, name, descriptor string, start, end *Label) {
+	if _, err := desc.ParseField(descriptor); err != nil {
+		c.fail("local %s: %v", name, err)
+		return
+	}
+	if slot < 0 || slot > MaxLocals {
+		c.fail("local %s: slot %d out of range", name, slot)
+		return
+	}
+	c.locals = append(c.locals, localRec{slot: slot, name: name, desc: descriptor,
+		start: start, end: end})
+}
+
 // ---------------------------------------------------------------- constants
 
 // Iconst pushes an int, picking the shortest of iconst_<i>, bipush, sipush
@@ -313,6 +358,20 @@ func (c *CodeWriter) Dconst(v float64) {
 
 // Sconst pushes a String constant.
 func (c *CodeWriter) Sconst(s string) { c.ldc(c.p.String(s), false) }
+
+// Cconst pushes a Class constant: the operand of `Foo.class`, and of the
+// desiredAssertionStatus call that initialises $assertionsDisabled.
+//
+// CONSTANT_Class is the one tag that became loadable later than it was
+// defined — 49.0, not 45.0 — so this is gated where nothing else is. It is
+// also the reason `assert` cannot be lowered against a 45.0 target.
+func (c *CodeWriter) Cconst(internal string) {
+	if !c.ver.AtLeast(Java5) {
+		c.fail("CONSTANT_Class is not loadable before class file 49.0 (this class is %s)", c.ver)
+		return
+	}
+	c.ldc(c.p.Class(internal), false)
+}
 
 // AconstNull pushes null.
 func (c *CodeWriter) AconstNull() {
@@ -460,6 +519,31 @@ func (c *CodeWriter) NewArray(typeCode uint8) {
 	c.push(1)
 }
 
+// MultiANewArray creates a multidimensional array, consuming one int per
+// dimension. The operand is an array descriptor rather than a class name —
+// "[[I", not "I" — and it must name at least as many dimensions as dims.
+func (c *CodeWriter) MultiANewArray(descriptor string, dims int) {
+	if dims < 1 || dims > 255 {
+		c.fail("multianewarray dimension count %d is outside 1..255", dims)
+		return
+	}
+	t, err := desc.ParseField(descriptor)
+	if err != nil {
+		c.fail("multianewarray: %v", err)
+		return
+	}
+	if t.Dims < dims {
+		c.fail("multianewarray %s has %d dimensions but %d were requested",
+			descriptor, t.Dims, dims)
+		return
+	}
+	c.emitOp(op.Multianewarray)
+	c.w.u2(c.p.Class(descriptor))
+	c.w.u1(uint8(dims))
+	c.pop(int32(dims))
+	c.push(1)
+}
+
 // CheckCast narrows a reference, throwing ClassCastException on failure.
 func (c *CodeWriter) CheckCast(internal string) {
 	c.emitOp(op.Checkcast)
@@ -473,10 +557,7 @@ func (c *CodeWriter) InstanceOf(internal string) {
 }
 
 // Throw raises the exception on the top of the stack.
-func (c *CodeWriter) Throw() {
-	c.emitOp(op.Athrow)
-	c.terminate()
-}
+func (c *CodeWriter) Throw() { c.Op(op.Athrow) }
 
 // ---------------------------------------------------------------- simple ops
 
@@ -599,6 +680,101 @@ var invert = map[op.Op]op.Op{
 	op.Ifnull: op.Ifnonnull, op.Ifnonnull: op.Ifnull,
 }
 
+// ---------------------------------------------------------------- switches
+
+// TableSwitch emits a tableswitch covering the contiguous range low..high,
+// one target per value. It pops the index and does not fall through.
+//
+// The four-byte padding after the opcode is measured from the start of the
+// code array, so this instruction's length depends on its own offset — which
+// moves when an earlier branch widens. That is handled by re-emitting on each
+// replay rather than by patching, and it is why the padding is remembered per
+// pass. A switch offset is a signed 32-bit field and never needs widening
+// itself, so a switch adds nothing to the fixpoint beyond shifting what
+// follows it.
+func (c *CodeWriter) TableSwitch(low, high int32, def *Label, targets []*Label) {
+	if high < low {
+		c.fail("tableswitch high %d is below low %d", high, low)
+		return
+	}
+	if n := int64(high) - int64(low) + 1; n != int64(len(targets)) {
+		c.fail("tableswitch covers %d..%d (%d entries) but was given %d targets",
+			low, high, n, len(targets))
+		return
+	}
+
+	at := c.w.len()
+	c.pop(1)
+	c.noteDepth(def)
+	for _, t := range targets {
+		c.noteDepth(t)
+	}
+
+	c.emitOp(op.Tableswitch)
+	pad := (4 - (at+1)%4) % 4
+	for i := 0; i < pad; i++ {
+		c.w.u1(0)
+	}
+	c.w.u4(0) // default, patched
+	c.w.u4(uint32(low))
+	c.w.u4(uint32(high))
+	for range targets {
+		c.w.u4(0)
+	}
+	c.switches = append(c.switches, switchRec{
+		op: op.Tableswitch, at: at, pad: pad, def: def, targets: targets,
+	})
+	c.terminate()
+}
+
+// LookupSwitch emits a lookupswitch over sparse match values. The pairs are
+// sorted here: §6.5 requires ascending order, and the verifier enforces it.
+func (c *CodeWriter) LookupSwitch(def *Label, matches []int32, targets []*Label) {
+	if len(matches) != len(targets) {
+		c.fail("lookupswitch has %d matches but %d targets", len(matches), len(targets))
+		return
+	}
+
+	ord := make([]int, len(matches))
+	for i := range ord {
+		ord[i] = i
+	}
+	sort.Slice(ord, func(a, b int) bool { return matches[ord[a]] < matches[ord[b]] })
+
+	sortedM := make([]int32, len(ord))
+	sortedT := make([]*Label, len(ord))
+	for i, j := range ord {
+		if i > 0 && matches[j] == sortedM[i-1] {
+			c.fail("lookupswitch has duplicate match value %d", matches[j])
+			return
+		}
+		sortedM[i], sortedT[i] = matches[j], targets[j]
+	}
+
+	at := c.w.len()
+	c.pop(1)
+	c.noteDepth(def)
+	for _, t := range sortedT {
+		c.noteDepth(t)
+	}
+
+	c.emitOp(op.Lookupswitch)
+	pad := (4 - (at+1)%4) % 4
+	for i := 0; i < pad; i++ {
+		c.w.u1(0)
+	}
+	c.w.u4(0) // default, patched
+	c.w.u4(uint32(len(sortedM)))
+	for _, m := range sortedM {
+		c.w.u4(uint32(m))
+		c.w.u4(0) // offset, patched
+	}
+	c.switches = append(c.switches, switchRec{
+		op: op.Lookupswitch, at: at, pad: pad, def: def, targets: sortedT,
+	})
+	c.terminate()
+}
+
 // ---------------------------------------------------------------- handlers
 
 // TryCatch registers an exception handler covering [start, end). Pass an
@@ -625,7 +801,10 @@ func (c *CodeWriter) Line(n int) {
 
 // ---------------------------------------------------------------- resolve
 
-// resolve patches branch offsets, reporting whether another pass is needed.
+// resolve patches branch and switch offsets, reporting whether another pass is
+// needed. Switches are patched only once the branches have settled: a widened
+// branch moves every label after it, so patching sooner would write offsets
+// that are about to be discarded.
 func (c *CodeWriter) resolve() (again bool) {
 	for _, br := range c.branches {
 		if br.label.pc < 0 {
@@ -647,11 +826,66 @@ func (c *CodeWriter) resolve() (again bool) {
 			c.w.patchU2(br.at+1, uint16(int16(off)))
 		}
 	}
-	return again
+	if again {
+		return true
+	}
+
+	for _, s := range c.switches {
+		base := int32(s.at)
+		body := s.at + 1 + s.pad
+		if s.def.pc < 0 {
+			c.fail("switch default label %d was never placed", s.def.id)
+			return false
+		}
+		c.w.patchU4(body, uint32(s.def.pc-base))
+
+		for i, t := range s.targets {
+			if t.pc < 0 {
+				c.fail("switch target label %d was never placed", t.id)
+				return false
+			}
+			off := uint32(t.pc - base)
+			if s.op == op.Tableswitch {
+				c.w.patchU4(body+12+4*i, off)
+			} else {
+				c.w.patchU4(body+8+8*i+4, off)
+			}
+		}
+	}
+	return false
 }
 
-// simpleDelta gives the stack effect of every operand-free opcode. A pop of
-// -1 marks an opcode this writer will not emit.
+// localRows converts the recorded locals to LocalVariableTable rows. Call it
+// only after resolve has converged; a zero-length range is dropped, since a
+// variable whose scope contains no instruction names nothing.
+func (c *CodeWriter) localRows() []LocalVariable {
+	out := make([]LocalVariable, 0, len(c.locals))
+	for _, l := range c.locals {
+		if l.start.pc < 0 || l.end.pc < 0 {
+			c.fail("local %s spans a label that was never placed", l.name)
+			return nil
+		}
+		if l.end.pc <= l.start.pc {
+			continue
+		}
+		out = append(out, LocalVariable{
+			StartPC:    uint16(l.start.pc),
+			Length:     uint16(l.end.pc - l.start.pc),
+			Name:       l.name,
+			Descriptor: l.desc,
+			Slot:       uint16(l.slot),
+		})
+	}
+	return out
+}
+
+// simpleDelta gives the stack effect of every operand-free opcode, counted in
+// slots. A pop of -1 marks an opcode this writer will not emit.
+//
+// Slot arithmetic is what makes the dup family tractable without category
+// tracking: dup2 on a long pops 2 and pushes 4, exactly as it does on two
+// ints. The category distinction decides which opcode is correct, which is the
+// caller's problem, not max_stack's.
 var simpleDelta = func() [256]struct{ pop, push int8 } {
 	var t [256]struct{ pop, push int8 }
 	for i := range t {
@@ -662,7 +896,9 @@ var simpleDelta = func() [256]struct{ pop, push int8 } {
 			t[o] = struct{ pop, push int8 }{pop, push}
 		}
 	}
-	set(0, 0, op.Nop, op.Monitorenter, op.Monitorexit)
+	set(0, 0, op.Nop)
+	// monitorenter and monitorexit each pop the objectref they lock.
+	set(1, 0, op.Monitorenter, op.Monitorexit)
 	set(0, 1, op.Iconst0, op.Iconst1, op.Iconst2, op.Iconst3, op.Iconst4, op.Iconst5,
 		op.IconstM1, op.Fconst0, op.Fconst1, op.Fconst2, op.AconstNull)
 	set(0, 2, op.Lconst0, op.Lconst1, op.Dconst0, op.Dconst1)
@@ -685,6 +921,9 @@ var simpleDelta = func() [256]struct{ pop, push int8 } {
 	set(1, 0, op.Pop, op.Ireturn, op.Freturn, op.Areturn)
 	set(2, 0, op.Pop2, op.Lreturn, op.Dreturn)
 	set(0, 0, op.Return)
+	// athrow clears the stack, but control cannot fall through it, so the depth
+	// after it is never read: the next Mark restores it from the label.
+	set(1, 0, op.Athrow)
 	set(1, 2, op.Dup)
 	set(2, 3, op.DupX1)
 	set(3, 4, op.DupX2)
