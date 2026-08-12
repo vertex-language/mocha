@@ -288,7 +288,10 @@ func (sc *sourceCompleter) recordComponents(c *ClassSym, comps []*ast.RecordComp
 			},
 			Class:  c,
 			Result: comp.Type,
-			Decl:   comp,
+			// No Decl: the implicit accessor has no MethodDecl of its own.
+			// comp is an ast.Node (via RecordComponent), not an ast.Decl, so
+			// it cannot fill MethodSym.Decl — record components aren't
+			// members in the declaration sense, per the comment above.
 		}
 		c.Members.Enter(accessor)
 	}

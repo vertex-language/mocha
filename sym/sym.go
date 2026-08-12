@@ -171,6 +171,13 @@ type ClassSym struct {
 	// nextAnon numbers the anonymous classes of this class's body. It lives
 	// here because §13.1's naming is per innermost enclosing class.
 	nextAnon int
+
+	// recordComponents lists a record's components in declaration order, as
+	// filled in by whichever completer ran: binary.go's binaryCompleter reads
+	// them from a classfile.Record, source.go's sourceCompleter from
+	// ast.RecordComponent. This is what lets a record pattern be checked in
+	// declaration order, which the field table alone loses.
+	recordComponents []*VarSym
 }
 
 func (*ClassSym) symbolNode() {}
@@ -282,7 +289,7 @@ type MethodSym struct {
 	Result     ast.Type // nil for void and for a binary symbol
 	Throws     []string // internal-form names, from a class file only
 	ThrowsExpr []ast.Type
-	Decl       ast.Decl // *ast.MethodDecl, *ast.ConstructorDecl or *ast.AnnotationElemDecl
+	Decl       ast.Decl // *ast.MethodDecl, *ast.ConstructorDecl or *ast.AnnotationElemDecl; nil for an implicit member with no declaration of its own
 	Default    ast.Node // an annotation element's default value
 }
 
